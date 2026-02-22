@@ -281,8 +281,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	ln, err := net.Listen("tcp", *listenAddr)
-	if err != nil {
+	m := newMetrics()
+	var lnMu sync.Mutex
+	var ln net.Listener
+
+	srv := &socks5.Server{
+		Dialer: m.instrumentedDialer(s.Dial),
+	}
+
+	startServing := func() error {
+		l, err := net.Listen("tcp", *listenAddr)
+		if err != nil {
+			return err
+		}
+		lnMu.Lock()
+		ln = l
+		lnMu.Unlock()
+		go srv.Serve(l)
+		return nil
+	}
+
+	stopServing := func() {
+		lnMu.Lock()
+		if ln != nil {
+			ln.Close()
+			ln = nil
+		}
+		lnMu.Unlock()
+		m.closeAllConns()
+	}
+
+	if err := startServing(); err != nil {
 		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
 		os.Exit(1)
 	}
@@ -298,21 +327,47 @@ func main() {
 		case <-ctx.Done():
 		}
 		cancel()
-		ln.Close()
+		stopServing()
 	}()
 
 	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n", *listenAddr, exitNodeIP)
 
-	m := newMetrics()
-	go m.readKeys(cancel)
+	togglePause := func() {
+		if m.paused.Load() {
+			if err := startServing(); err != nil {
+				return
+			}
+			m.unpause()
+		} else {
+			m.pause()
+			stopServing()
+		}
+	}
+
+	switchExitNode := func() {
+		newIP, err := pickExitNode(lc, exitNodeIP.String())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "switch exit node: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Switching exit node to %s...", newIP)
+		mp := &ipn.MaskedPrefs{
+			Prefs: ipn.Prefs{
+				ExitNodeIP: newIP,
+			},
+			ExitNodeIPSet: true,
+		}
+		if _, err := lc.EditPrefs(context.Background(), mp); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+			return
+		}
+		exitNodeIP = newIP
+		saveLastExitNode(stDir, exitNodeIP)
+		fmt.Fprintf(os.Stderr, " done")
+	}
+
+	go m.readKeys(cancel, togglePause, switchExitNode)
 	go m.displayLoop(ctx)
 
-	srv := &socks5.Server{
-		Dialer: m.instrumentedDialer(s.Dial),
-	}
-
-	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "socks5 serve: %v\n", err)
-		os.Exit(1)
-	}
+	<-ctx.Done()
 }
