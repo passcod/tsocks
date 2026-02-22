@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type metrics struct {
@@ -19,6 +21,13 @@ type metrics struct {
 
 func newMetrics() *metrics {
 	return &metrics{startTime: time.Now()}
+}
+
+func (m *metrics) reset() {
+	m.startTime = time.Now()
+	m.bytesUp.Store(0)
+	m.bytesDown.Store(0)
+	m.totalConns.Store(0)
 }
 
 // instrumentedDialer wraps a dialer to track bytes and connections through tsnet.
@@ -88,7 +97,33 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
-// displayLoop updates a single status line on stderr once per second.
+// readKeys reads single keypresses from stdin in raw mode.
+func (m *metrics) readKeys(cancel context.CancelFunc) {
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	buf := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			return
+		}
+		switch buf[0] {
+		case 'q', 'Q', 0x03: // q or Ctrl-C
+			cancel()
+			return
+		case 'r', 'R':
+			m.reset()
+		}
+	}
+}
+
+const helpLine = "q quit │ r reset metrics"
+
+// displayLoop updates a two-line status display on stderr once per second.
 func (m *metrics) displayLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -98,7 +133,9 @@ func (m *metrics) displayLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "\033[2K\rSession: %s │ ↑ %s │ ↓ %s │ %d connections\n",
+			// Clear the two display lines, then print final summary
+			fmt.Fprintf(os.Stderr, "\033[2K\r\033[A\033[2K\r")
+			fmt.Fprintf(os.Stderr, "Session: %s │ ↑ %s │ ↓ %s │ %d connections\n",
 				formatDuration(time.Since(m.startTime)),
 				formatBytes(m.bytesUp.Load()),
 				formatBytes(m.bytesDown.Load()),
@@ -123,7 +160,9 @@ func (m *metrics) displayLoop(ctx context.Context) {
 				connStr = fmt.Sprintf("%d conns", active)
 			}
 
-			fmt.Fprintf(os.Stderr, "\033[2K\r⏱ %s │ ↑ %s (%s/s) │ ↓ %s (%s/s) │ %s",
+			// Move up, clear, print help, then newline, clear, print metrics
+			fmt.Fprintf(os.Stderr, "\033[2K\r%s\n\033[2K\r⏱ %s │ ↑ %s (%s/s) │ ↓ %s (%s/s) │ %s\033[A\r",
+				helpLine,
 				formatDuration(elapsed),
 				formatBytes(up), formatBytes(upRate),
 				formatBytes(down), formatBytes(downRate),

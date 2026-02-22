@@ -287,20 +287,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Graceful shutdown on signal
+	// Graceful shutdown on signal or keypress
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
+		select {
+		case <-sig:
+		case <-ctx.Done():
+		}
 		cancel()
 		ln.Close()
 	}()
 
-	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n", *listenAddr, exitNodeIP)
+	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n", *listenAddr, exitNodeIP)
 
 	m := newMetrics()
+	go m.readKeys(cancel)
 	go m.displayLoop(ctx)
 
 	srv := &socks5.Server{
