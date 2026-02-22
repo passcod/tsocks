@@ -223,12 +223,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("SOCKS5 proxy listening on %s (exit node %s)", *listenAddr, exitNodeIP)
-
-	srv := &socks5.Server{
-		Logf:   log.Printf,
-		Dialer: s.Dial,
-	}
 
 	// Graceful shutdown on signal
 	ctx, cancel := context.WithCancel(context.Background())
@@ -237,11 +231,18 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
-		log.Println("Shutting down...")
 		cancel()
 		ln.Close()
 	}()
-	_ = ctx
+
+	log.Printf("SOCKS5 proxy listening on %s (exit node %s)", *listenAddr, exitNodeIP)
+
+	m := newMetrics()
+	go m.displayLoop(ctx)
+
+	srv := &socks5.Server{
+		Dialer: m.instrumentedDialer(s.Dial),
+	}
 
 	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
 		log.Fatalf("socks5 serve: %v", err)
