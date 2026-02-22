@@ -1,4 +1,4 @@
-module tsocks
+module github.com/passcod/tsocks
 
 go 1.25.5
 
