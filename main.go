@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"strings"
 	"syscall"
+
+	"time"
 
 	"github.com/charmbracelet/huh"
 	flag "github.com/spf13/pflag"
@@ -97,6 +100,21 @@ func exitNodeLabel(peer *ipnstate.PeerStatus) string {
 	return label
 }
 
+func exitNodeHostname(lc *local.Client, ip netip.Addr) string {
+	st, err := lc.Status(context.Background())
+	if err != nil {
+		return ip.String()
+	}
+	for _, peer := range st.Peer {
+		for _, pip := range peer.TailscaleIPs {
+			if pip == ip {
+				return peer.HostName
+			}
+		}
+	}
+	return ip.String()
+}
+
 func exitNodeName(lc *local.Client, ip netip.Addr) string {
 	st, err := lc.Status(context.Background())
 	if err != nil {
@@ -173,6 +191,39 @@ func pickExitNode(lc *local.Client, lastIP string) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("parse selected IP: %w", err)
 	}
 	return ip, nil
+}
+
+func probeIPs(dial func(ctx context.Context, network, addr string) (net.Conn, error)) (v4, v6 string) {
+	transport := &http.Transport{}
+	if dial != nil {
+		transport.DialContext = dial
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+	probe := func(url string) string {
+		resp, err := client.Get(url)
+		if err != nil {
+			return ""
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+		if err != nil {
+			return ""
+		}
+		ip := strings.TrimSpace(string(body))
+		if _, err := netip.ParseAddr(ip); err != nil {
+			return ""
+		}
+		return ip
+	}
+
+	ch4 := make(chan string, 1)
+	ch6 := make(chan string, 1)
+	go func() { ch4 <- probe("https://api4.ipify.org") }()
+	go func() { ch6 <- probe("https://api6.ipify.org") }()
+	return <-ch4, <-ch6
 }
 
 func main() {
@@ -299,7 +350,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Remove inline IP probe — handled by displayLoop now
 	m := newMetrics()
+	m.probeIPs = func() (string, string) { return probeIPs(s.Dial) }
+	m.probeDirectIPs = func() (string, string) { return probeIPs(nil) }
+	m.setExitNode(exitNodeHostname(lc, exitNodeIP))
 	var lnMu sync.Mutex
 	var ln net.Listener
 
@@ -348,7 +403,7 @@ func main() {
 		stopServing()
 	}()
 
-	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n", *listenAddr, exitNodeDesc)
+	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n\n", *listenAddr, exitNodeDesc)
 
 	togglePause := func() {
 		if m.paused.Load() {
@@ -381,6 +436,7 @@ func main() {
 		}
 		exitNodeIP = newIP
 		saveLastExitNode(stDir, exitNodeIP)
+		m.setExitNode(exitNodeHostname(lc, exitNodeIP))
 		fmt.Fprintf(os.Stderr, " done")
 	}
 

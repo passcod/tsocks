@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,14 @@ type metrics struct {
 	paused      atomic.Bool
 	mu          sync.Mutex
 	connSet     map[*countConn]struct{}
+	extIPmu      sync.RWMutex
+	extIPv4      string
+	extIPv6      string
+	directIPv4   string
+	directIPv6   string
+	exitNode     string // display name for current exit node
+	probeIPs     func() (v4, v6 string) // through tsnet
+	probeDirectIPs func() (v4, v6 string) // direct (no proxy)
 }
 
 func newMetrics() *metrics {
@@ -55,6 +64,60 @@ func (m *metrics) sessionDuration() time.Duration {
 		return m.elapsed
 	}
 	return m.elapsed + time.Since(m.startTime)
+}
+
+func (m *metrics) refreshExternalIPs() {
+	if m.probeIPs != nil {
+		v4, v6 := m.probeIPs()
+		m.extIPmu.Lock()
+		m.extIPv4 = v4
+		m.extIPv6 = v6
+		m.extIPmu.Unlock()
+	}
+	if m.probeDirectIPs != nil {
+		v4, v6 := m.probeDirectIPs()
+		m.extIPmu.Lock()
+		m.directIPv4 = v4
+		m.directIPv6 = v6
+		m.extIPmu.Unlock()
+	}
+}
+
+func (m *metrics) externalIPLine() string {
+	m.extIPmu.RLock()
+	v4, v6, node := m.extIPv4, m.extIPv6, m.exitNode
+	dv4, dv6, isPaused := m.directIPv4, m.directIPv6, m.paused.Load()
+	m.extIPmu.RUnlock()
+
+	formatIPs := func(a, b string) string {
+		parts := []string{}
+		if a != "" {
+			parts = append(parts, a)
+		}
+		if b != "" {
+			parts = append(parts, b)
+		}
+		if len(parts) == 0 {
+			return "probing..."
+		}
+		return strings.Join(parts, ", ")
+	}
+
+	if isPaused {
+		return "no proxy: " + formatIPs(dv4, dv6)
+	}
+
+	prefix := node
+	if prefix == "" {
+		prefix = "Exit node"
+	}
+	return prefix + ": " + formatIPs(v4, v6)
+}
+
+func (m *metrics) setExitNode(name string) {
+	m.extIPmu.Lock()
+	m.exitNode = name
+	m.extIPmu.Unlock()
 }
 
 func (m *metrics) closeAllConns() {
@@ -167,31 +230,43 @@ func (m *metrics) readKeys(cancel context.CancelFunc, onPause func(), onSwitch f
 			onPause()
 		case 's', 'S':
 			m.hideDisplay.Store(true)
-			// Clear display lines for picker
-			fmt.Fprintf(os.Stderr, "\033[2K\r\n\033[2K\r\033[A")
+			// Clear 3 display lines for picker
+			fmt.Fprintf(os.Stderr, "\033[2K\r\n\033[2K\r\n\033[2K\r\033[A\033[A")
 			term.Restore(int(os.Stdin.Fd()), oldState)
 			onSwitch()
-			fmt.Fprintln(os.Stderr)
+			fmt.Fprintf(os.Stderr, "\n\n")
 			oldState, _ = term.MakeRaw(int(os.Stdin.Fd()))
+			m.refreshExternalIPs()
 			m.hideDisplay.Store(false)
 		}
 	}
 }
 
-const helpLine = "q quit │ r reset │ p pause │ s switch exit node"
+func helpLine(paused bool) string {
+	p := "p pause"
+	if paused {
+		p = "p unpause"
+	}
+	return fmt.Sprintf("q quit │ r reset │ %s │ s switch exit node", p)
+}
 
-// displayLoop updates a two-line status display on stderr once per second.
+// displayLoop updates a three-line status display on stderr once per second.
 func (m *metrics) displayLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
+	// Refresh external IPs on start, then every 5 minutes
+	go m.refreshExternalIPs()
+	ipTicker := time.NewTicker(5 * time.Minute)
+	defer ipTicker.Stop()
 
 	var lastUp, lastDown int64
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Clear the two display lines, then print final summary
-			fmt.Fprintf(os.Stderr, "\033[2K\r\033[A\033[2K\r")
+			// Clear the three display lines, then print final summary
+			fmt.Fprintf(os.Stderr, "\033[2K\r\n\033[2K\r\n\033[2K\r\033[A\033[A")
 			fmt.Fprintf(os.Stderr, "Session: %s │ ↑ %s │ ↓ %s │ %d connections\n",
 				formatDuration(m.sessionDuration()),
 				formatBytes(m.bytesUp.Load()),
@@ -199,6 +274,8 @@ func (m *metrics) displayLoop(ctx context.Context) {
 				m.totalConns.Load(),
 			)
 			return
+		case <-ipTicker.C:
+			go m.refreshExternalIPs()
 		case <-ticker.C:
 			if m.hideDisplay.Load() {
 				continue
@@ -221,13 +298,15 @@ func (m *metrics) displayLoop(ctx context.Context) {
 				connStr = fmt.Sprintf("%d conns", active)
 			}
 
+			isPaused := m.paused.Load()
 			status := ""
-			if m.paused.Load() {
+			if isPaused {
 				status = "PAUSED │ "
 			}
 
-			fmt.Fprintf(os.Stderr, "\033[2K\r%s\n\033[2K\r%s⏱ %s │ ↑ %s (%s/s) │ ↓ %s (%s/s) │ %s\033[A\r",
-				helpLine,
+			fmt.Fprintf(os.Stderr, "\033[2K\r%s\n\033[2K\r%s\n\033[2K\r%s⏱ %s │ ↑ %s (%s/s) │ ↓ %s (%s/s) │ %s\033[A\033[A\r",
+				helpLine(isPaused),
+				m.externalIPLine(),
 				status,
 				formatDuration(elapsed),
 				formatBytes(up), formatBytes(upRate),
