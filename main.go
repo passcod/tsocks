@@ -228,6 +228,7 @@ func probeIPs(dial func(ctx context.Context, network, addr string) (net.Conn, er
 
 func main() {
 	listenAddr := flag.String("listen", "localhost:1080", "SOCKS5 listen address")
+	i2pAddr := flag.String("i2p-listen", "localhost:4444", "I2P-compatible HTTP proxy listen address")
 	exitNode := flag.String("exit-node", "", "exit node IP or tailscale hostname (default: last used)")
 	hostname := flag.String("hostname", "tsocks", "tailscale hostname for this node")
 	stateDirFlag := flag.String("state", "", "state directory (default: tsnet auto)")
@@ -355,30 +356,45 @@ func main() {
 	m.probeIPs = func() (string, string) { return probeIPs(s.Dial) }
 	m.probeDirectIPs = func() (string, string) { return probeIPs(nil) }
 	m.setExitNode(exitNodeHostname(lc, exitNodeIP))
-	var lnMu sync.Mutex
-	var ln net.Listener
 
-	srv := &socks5.Server{
-		Dialer: m.instrumentedDialer(s.Dial),
+	dial := m.instrumentedDialer(s.Dial)
+	var lnMu sync.Mutex
+	var socksLn, httpLn net.Listener
+
+	socksSrv := &socks5.Server{
+		Dialer: dial,
 	}
+
+	httpProxy := &httpConnectProxy{dial: dial}
 
 	startServing := func() error {
 		l, err := net.Listen("tcp", *listenAddr)
 		if err != nil {
 			return err
 		}
+		h, err := net.Listen("tcp", *i2pAddr)
+		if err != nil {
+			l.Close()
+			return err
+		}
 		lnMu.Lock()
-		ln = l
+		socksLn = l
+		httpLn = h
 		lnMu.Unlock()
-		go srv.Serve(l)
+		go socksSrv.Serve(l)
+		go httpProxy.Serve(h)
 		return nil
 	}
 
 	stopServing := func() {
 		lnMu.Lock()
-		if ln != nil {
-			ln.Close()
-			ln = nil
+		if socksLn != nil {
+			socksLn.Close()
+			socksLn = nil
+		}
+		if httpLn != nil {
+			httpLn.Close()
+			httpLn = nil
 		}
 		lnMu.Unlock()
 		m.closeAllConns()
@@ -403,7 +419,7 @@ func main() {
 		stopServing()
 	}()
 
-	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n\n", *listenAddr, exitNodeDesc)
+	fmt.Fprintf(os.Stderr, "SOCKS5 proxy on %s │ HTTP proxy on %s (exit node %s)\n\n\n", *listenAddr, *i2pAddr, exitNodeDesc)
 
 	togglePause := func() {
 		if m.paused.Load() {
@@ -415,6 +431,7 @@ func main() {
 			m.pause()
 			stopServing()
 		}
+		go m.refreshExternalIPs()
 	}
 
 	switchExitNode := func() {
