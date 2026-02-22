@@ -5,7 +5,7 @@ This is designed to be super lightweight and convenient to use, instead of the `
 ## Install
 
 ```
-go get github.com/passcod/tsocks
+go install github.com/passcod/tsocks@latest
 ```
 
 ## Use
