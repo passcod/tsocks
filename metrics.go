@@ -98,7 +98,12 @@ func (m *metrics) displayLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprint(os.Stderr, "\033[2K\r")
+			fmt.Fprintf(os.Stderr, "\033[2K\rSession: %s │ ↑ %s │ ↓ %s │ %d connections\n",
+				formatDuration(time.Since(m.startTime)),
+				formatBytes(m.bytesUp.Load()),
+				formatBytes(m.bytesDown.Load()),
+				m.totalConns.Load(),
+			)
 			return
 		case <-ticker.C:
 			up := m.bytesUp.Load()

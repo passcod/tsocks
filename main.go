@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"sync"
 	"strings"
 	"syscall"
 
@@ -51,6 +53,28 @@ func saveLastExitNode(dir string, ip netip.Addr) {
 		return
 	}
 	os.WriteFile(filepath.Join(dir, lastExitNodeFile), []byte(ip.String()+"\n"), 0644)
+}
+
+func hasStateFile(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "tailscaled.state"))
+	return err == nil
+}
+
+type switchableWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *switchableWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+func (s *switchableWriter) switchTo(w io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.w = w
 }
 
 func exitNodeLabel(peer *ipnstate.PeerStatus) string {
@@ -122,6 +146,7 @@ func pickExitNode(lc *local.Client, lastIP string) (netip.Addr, error) {
 		Title("Select exit node").
 		Options(huhOpts...).
 		Height(min(len(huhOpts)+2, 20)).
+		Filtering(true).
 		Value(&selected).
 		Run()
 	if err != nil {
@@ -143,36 +168,69 @@ func main() {
 	flag.Parse()
 
 	stDir := stateDir(*hostname, *stateDirFlag)
+	os.MkdirAll(stDir, 0700)
+
+	// Send tsnet verbose logs to a file, not the console
+	logFile, err := os.Create(filepath.Join(stDir, "tsnet.log"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
+	// If already authenticated, logs go straight to file.
+	// Otherwise, tee to stderr so the user sees the auth URL,
+	// then switch to file-only once Up() returns.
+	needsAuth := !hasStateFile(stDir)
+	sw := &switchableWriter{w: logFile}
+	if needsAuth {
+		sw.w = io.MultiWriter(os.Stderr, logFile)
+	}
+	tsnetLog := log.New(sw, "", log.LstdFlags)
+	log.SetOutput(sw)
 
 	s := &tsnet.Server{
 		Hostname: *hostname,
+		Logf:     tsnetLog.Printf,
+		UserLogf: tsnetLog.Printf,
 	}
 	if *stateDirFlag != "" {
 		s.Dir = *stateDirFlag
 	}
 	defer s.Close()
 
-	log.Printf("Starting tsnet node %q...", *hostname)
+	fmt.Fprintf(os.Stderr, "Starting tsnet node %q...\n", *hostname)
 	status, err := s.Up(context.Background())
 	if err != nil {
-		log.Fatalf("tsnet up: %v", err)
+		fmt.Fprintf(os.Stderr, "tsnet up: %v\n", err)
+		os.Exit(1)
 	}
-	log.Printf("Tailscale node up: %s", status.TailscaleIPs[0])
+
+	// Auth complete — switch logs to file only
+	if needsAuth {
+		fmt.Fprintln(os.Stderr)
+	}
+	sw.switchTo(logFile)
+
+	fmt.Fprintf(os.Stderr, "Tailscale node up: %s\n", status.TailscaleIPs[0])
 
 	lc, err := s.LocalClient()
 	if err != nil {
-		log.Fatalf("local client: %v", err)
+		fmt.Fprintf(os.Stderr, "local client: %v\n", err)
+		os.Exit(1)
 	}
 
 	var exitNodeIP netip.Addr
 	lastIP := loadLastExitNode(stDir)
 	if *exitNode == "last" {
 		if lastIP == "" {
-			log.Fatal("no previously used exit node found")
+			fmt.Fprintln(os.Stderr, "no previously used exit node found")
+			os.Exit(1)
 		}
 		ip, err := netip.ParseAddr(lastIP)
 		if err != nil {
-			log.Fatalf("invalid saved exit node %q: %v", lastIP, err)
+			fmt.Fprintf(os.Stderr, "invalid saved exit node %q: %v\n", lastIP, err)
+			os.Exit(1)
 		}
 		exitNodeIP = ip
 	} else if *exitNode != "" {
@@ -182,7 +240,8 @@ func main() {
 		} else {
 			st, err := lc.Status(context.Background())
 			if err != nil {
-				log.Fatalf("get status: %v", err)
+				fmt.Fprintf(os.Stderr, "get status: %v\n", err)
+				os.Exit(1)
 			}
 			target := strings.TrimSuffix(strings.ToLower(*exitNode), ".")
 			for _, peer := range st.Peer {
@@ -196,19 +255,21 @@ func main() {
 				}
 			}
 			if !exitNodeIP.IsValid() {
-				log.Fatalf("exit node %q not found among peers", *exitNode)
+				fmt.Fprintf(os.Stderr, "exit node %q not found among peers\n", *exitNode)
+				os.Exit(1)
 			}
 		}
 	} else {
 		exitNodeIP, err = pickExitNode(lc, lastIP)
 		if err != nil {
-			log.Fatalf("pick exit node: %v", err)
+			fmt.Fprintf(os.Stderr, "pick exit node: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
 	saveLastExitNode(stDir, exitNodeIP)
 
-	log.Printf("Setting exit node to %s...", exitNodeIP)
+	fmt.Fprintf(os.Stderr, "Setting exit node to %s...\n", exitNodeIP)
 	mp := &ipn.MaskedPrefs{
 		Prefs: ipn.Prefs{
 			ExitNodeIP: exitNodeIP,
@@ -216,12 +277,14 @@ func main() {
 		ExitNodeIPSet: true,
 	}
 	if _, err := lc.EditPrefs(context.Background(), mp); err != nil {
-		log.Fatalf("set exit node: %v", err)
+		fmt.Fprintf(os.Stderr, "set exit node: %v\n", err)
+		os.Exit(1)
 	}
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Graceful shutdown on signal
@@ -235,7 +298,7 @@ func main() {
 		ln.Close()
 	}()
 
-	log.Printf("SOCKS5 proxy listening on %s (exit node %s)", *listenAddr, exitNodeIP)
+	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n", *listenAddr, exitNodeIP)
 
 	m := newMetrics()
 	go m.displayLoop(ctx)
@@ -245,6 +308,7 @@ func main() {
 	}
 
 	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
-		log.Fatalf("socks5 serve: %v", err)
+		fmt.Fprintf(os.Stderr, "socks5 serve: %v\n", err)
+		os.Exit(1)
 	}
 }
