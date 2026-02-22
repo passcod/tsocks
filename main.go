@@ -97,6 +97,21 @@ func exitNodeLabel(peer *ipnstate.PeerStatus) string {
 	return label
 }
 
+func exitNodeName(lc *local.Client, ip netip.Addr) string {
+	st, err := lc.Status(context.Background())
+	if err != nil {
+		return ip.String()
+	}
+	for _, peer := range st.Peer {
+		for _, pip := range peer.TailscaleIPs {
+			if pip == ip {
+				return exitNodeLabel(peer) + " " + ip.String()
+			}
+		}
+	}
+	return ip.String()
+}
+
 func pickExitNode(lc *local.Client, lastIP string) (netip.Addr, error) {
 	st, err := lc.Status(context.Background())
 	if err != nil {
@@ -270,8 +285,9 @@ func main() {
 	}
 
 	saveLastExitNode(stDir, exitNodeIP)
+	exitNodeDesc := exitNodeName(lc, exitNodeIP)
 
-	fmt.Fprintf(os.Stderr, "Setting exit node to %s...\n", exitNodeIP)
+	fmt.Fprintf(os.Stderr, "Setting exit node to %s...\n", exitNodeDesc)
 	mp := &ipn.MaskedPrefs{
 		Prefs: ipn.Prefs{
 			ExitNodeIP: exitNodeIP,
@@ -332,7 +348,7 @@ func main() {
 		stopServing()
 	}()
 
-	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n", *listenAddr, exitNodeIP)
+	fmt.Fprintf(os.Stderr, "SOCKS5 proxy listening on %s (exit node %s)\n\n", *listenAddr, exitNodeDesc)
 
 	togglePause := func() {
 		if m.paused.Load() {
@@ -352,7 +368,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "switch exit node: %v\n", err)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "Switching exit node to %s...", newIP)
+		fmt.Fprintf(os.Stderr, "Switching exit node to %s...", exitNodeName(lc, newIP))
 		mp := &ipn.MaskedPrefs{
 			Prefs: ipn.Prefs{
 				ExitNodeIP: newIP,
