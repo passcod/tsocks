@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/charmbracelet/huh v0.8.0
+	github.com/spf13/pflag v1.0.9
 	tailscale.com v1.94.2
 )
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/huh"
+	flag "github.com/spf13/pflag"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
