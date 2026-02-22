@@ -162,7 +162,7 @@ func pickExitNode(lc *local.Client, lastIP string) (netip.Addr, error) {
 
 func main() {
 	listenAddr := flag.String("listen", "localhost:1080", "SOCKS5 listen address")
-	exitNode := flag.String("exit-node", "", "exit node IP, tailscale hostname, or \"last\"")
+	exitNode := flag.String("exit-node", "", "exit node IP or tailscale hostname (default: last used)")
 	hostname := flag.String("hostname", "tsocks", "tailscale hostname for this node")
 	stateDirFlag := flag.String("state", "", "state directory (default: tsnet auto)")
 	flag.Parse()
@@ -222,18 +222,7 @@ func main() {
 
 	var exitNodeIP netip.Addr
 	lastIP := loadLastExitNode(stDir)
-	if *exitNode == "last" {
-		if lastIP == "" {
-			fmt.Fprintln(os.Stderr, "no previously used exit node found")
-			os.Exit(1)
-		}
-		ip, err := netip.ParseAddr(lastIP)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid saved exit node %q: %v\n", lastIP, err)
-			os.Exit(1)
-		}
-		exitNodeIP = ip
-	} else if *exitNode != "" {
+	if *exitNode != "" {
 		// Resolve exit node: try as IP first, then look up by hostname
 		if ip, err := netip.ParseAddr(*exitNode); err == nil {
 			exitNodeIP = ip
@@ -259,8 +248,21 @@ func main() {
 				os.Exit(1)
 			}
 		}
+	} else if lastIP != "" {
+		// Default to last-used exit node
+		ip, err := netip.ParseAddr(lastIP)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid saved exit node %q, showing picker\n", lastIP)
+			exitNodeIP, err = pickExitNode(lc, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pick exit node: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			exitNodeIP = ip
+		}
 	} else {
-		exitNodeIP, err = pickExitNode(lc, lastIP)
+		exitNodeIP, err = pickExitNode(lc, "")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "pick exit node: %v\n", err)
 			os.Exit(1)
